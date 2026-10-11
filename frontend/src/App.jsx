@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import Sidebar from './components/Sidebar';
+import CoralChat from './components/CoralChat';
 import { ErrorState, LoadingState } from './components/LoadingState';
 import ViewInicio from './views/ViewInicio';
 import ViewCorales from './views/ViewCorales';
