@@ -6,9 +6,11 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote_plus
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pymongo import MongoClient
@@ -278,3 +280,101 @@ def historico_area(fid: int):
         "total_registros": len(historico),
         "historico": historico,
     }
+
+
+
+@app.post("/chat")
+def chat_coral(payload: dict = Body(...)):
+    webhook_url = os.getenv("MAKE_CHAT_WEBHOOK_URL", "").strip()
+    if not webhook_url:
+        raise HTTPException(
+            status_code=503,
+            detail="El chat todavía no está configurado. Falta MAKE_CHAT_WEBHOOK_URL en el entorno del backend.",
+        )
+
+    mensaje = str(payload.get("message", "")).strip()
+    if not mensaje:
+        raise HTTPException(status_code=400, detail="Escribe una pregunta para Coral.")
+    if len(mensaje) > 1500:
+        raise HTTPException(status_code=400, detail="La pregunta no puede superar los 1500 caracteres.")
+
+    fecha_solicitada = payload.get("fecha")
+    if fecha_solicitada:
+        fecha_datetime = convertir_fecha(str(fecha_solicitada))
+        if fecha_datetime not in obtener_fechas():
+            raise HTTPException(status_code=404, detail=f"No hay datos para la fecha {fecha_solicitada}.")
+        fecha_contexto = formatear_fecha(fecha_datetime)
+    else:
+        fecha_contexto = formatear_fecha(obtener_ultima_fecha())
+
+    datos_areas = obtener_areas_por_fecha(fecha_contexto) if fecha_contexto else []
+    conteo = {"Baja": 0, "Intermedia": 0, "Alta": 0}
+    for item in datos_areas:
+        categoria = item["categoria_exposicion_relativa"]
+        conteo[categoria] = conteo.get(categoria, 0) + 1
+
+    contexto = {
+        "fecha_consultada": fecha_contexto,
+        "total_areas_con_datos": len(datos_areas),
+        "clasificacion_exposicion_relativa": conteo,
+        "areas": [
+            {
+                "fid": item["fid_area_coralina"],
+                "dhw_promedio": item["dhw_promedio"],
+                "dhw_max_asociado": item["dhw_max_asociado"],
+                "sst_promedio": item["sst_promedio"],
+                "ssta_promedio": item["ssta_promedio"],
+                "hotspot_promedio": item["hotspot_promedio"],
+                "categoria": item["categoria_exposicion_relativa"],
+            }
+            for item in datos_areas
+        ],
+        "nota": "Baja, Intermedia y Alta son categorías relativas internas del proyecto, no alertas oficiales NOAA."
+    }
+
+    solicitud_make = {
+        "request": (
+            "Pregunta del usuario: " + mensaje
+            + "\\n\\nContexto actual verificado de Coraleum (JSON): "
+            + json.dumps(contexto, ensure_ascii=False)
+            + "\\n\\nResponde en español claro. Usa el contexto para preguntas sobre datos actuales. "
+            "Si la información no está en el contexto, dilo y no inventes valores."
+        ),
+        "conversationID": str(payload.get("conversation_id") or "coraleum-web"),
+        "source": "coraleum-web",
+    }
+
+    headers = {"Content-Type": "application/json"}
+    api_key = os.getenv("MAKE_CHAT_API_KEY", "").strip()
+    if api_key:
+        headers["x-make-apikey"] = api_key
+
+    request = Request(
+        webhook_url,
+        data=json.dumps(solicitud_make, ensure_ascii=False).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+
+    try:
+        with urlopen(request, timeout=45) as response:
+            respuesta_make = json.loads(response.read().decode("utf-8"))
+    except HTTPError as error:
+        raise HTTPException(status_code=502, detail=f"Make devolvió el estado HTTP {error.code}.") from error
+    except (URLError, TimeoutError, json.JSONDecodeError) as error:
+        raise HTTPException(status_code=502, detail="No fue posible obtener respuesta del escenario de Make.") from error
+
+    respuesta = (
+        respuesta_make.get("response")
+        or respuesta_make.get("reply")
+        or respuesta_make.get("message")
+    ) if isinstance(respuesta_make, dict) else None
+    if not respuesta and isinstance(respuesta_make, str):
+        respuesta = respuesta_make
+    if not respuesta:
+        raise HTTPException(
+            status_code=502,
+            detail="Make respondió, pero no se encontró el campo 'response'. Revisa el módulo Webhook response.",
+        )
+
+    return {"reply": str(respuesta), "fecha_consultada": fecha_contexto}
